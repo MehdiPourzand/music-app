@@ -1,0 +1,1064 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Music App</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #1a1a2e;
+      color: #eee;
+      font-family: 'Segoe UI', sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 24px;
+      gap: 28px;
+      min-height: 100vh;
+    }
+
+    /* ── Pads ── */
+    .pad-row {
+      display: flex;
+      gap: 20px;
+    }
+
+    .pad {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .key-btn {
+      width: 90px;
+      height: 90px;
+      border-radius: 12px;
+      background: #2d2d4e;
+      border: 2px solid #4a4a7a;
+      color: #c8a96e;
+      font-size: 2rem;
+      font-weight: bold;
+      cursor: pointer;
+      transition: background 0.05s, border-color 0.05s, transform 0.05s;
+      user-select: none;
+      outline: none;
+    }
+
+    .key-btn:hover { border-color: #c8a96e; }
+
+    .key-btn.active {
+      background: #c8a96e;
+      color: #1a1a2e;
+      border-color: #e8c98e;
+      transform: scale(0.96);
+    }
+
+    .freq-input {
+      width: 90px;
+      padding: 6px 8px;
+      background: #12122a;
+      border: 1px solid #4a4a7a;
+      border-radius: 6px;
+      color: #eee;
+      font-size: 0.85rem;
+      text-align: center;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .freq-input:focus { border-color: #c8a96e; }
+
+    .freq-display {
+      width: 90px;
+      padding: 6px 8px;
+      background: #12122a;
+      border: 1px solid #4a4a7a;
+      border-radius: 6px;
+      color: #c8a96e;
+      font-size: 0.85rem;
+      text-align: center;
+      user-select: none;
+    }
+
+    #micBtn { font-size: 1.4rem; }
+
+    /* ── Transport ── */
+    .transport {
+      display: flex;
+      gap: 12px;
+    }
+
+    .tbtn {
+      width: 48px;
+      height: 40px;
+      padding: 0;
+      border-radius: 8px;
+      border: none;
+      font-size: 1.1rem;
+      font-weight: bold;
+      cursor: pointer;
+      transition: opacity 0.15s, transform 0.1s;
+      user-select: none;
+    }
+
+    .tbtn:disabled { opacity: 0.35; cursor: default; pointer-events: none; }
+    .tbtn:not(:disabled):hover { opacity: 0.82; }
+    .tbtn:not(:disabled):active { transform: scale(0.96); }
+
+    #btnPlay  { background: #27ae60; color: #fff; }
+    #btnStop  { background: #c0392b; color: #fff; }
+    #btnClear { background: #4a4a7a; color: #fff; }
+
+    /* ── Timeline ── */
+    #timelineWrap {
+      width: 100%;
+      max-width: 860px;
+    }
+
+    #timeline {
+      display: block;
+      border-radius: 6px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="pad-row" id="padRow"></div>
+
+  <div class="transport">
+    <button class="tbtn" id="btnPlay">▶</button>
+    <button class="tbtn" id="btnStop">■</button>
+    <button class="tbtn" id="btnClear">✕</button>
+  </div>
+
+  <div id="timelineWrap">
+    <canvas id="timeline"></canvas>
+  </div>
+
+<script>
+// ════════════════════════════════════════════
+// PADS
+// ════════════════════════════════════════════
+const NUM_PADS = 6;
+const DEFAULT_FREQS = [262, 294, 330, 349, 392, 440];
+const savedFreqs = JSON.parse(localStorage.getItem('saxPadFreqs') || 'null') || DEFAULT_FREQS;
+
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+const activeVoices = {};
+const buttons = [], inputs = [];
+
+const padRow = document.getElementById('padRow');
+for (let i = 0; i < NUM_PADS; i++) {
+  const pad = document.createElement('div');
+  pad.className = 'pad';
+
+  const btn = document.createElement('button');
+  btn.className = 'key-btn';
+  btn.textContent = i + 1;
+
+  const input = document.createElement('input');
+  input.className = 'freq-input';
+  input.type = 'number';
+  input.min = '20';
+  input.max = '20000';
+  input.step = '1';
+  input.value = Math.round(savedFreqs[i]);
+  input.addEventListener('change', saveFreqs);
+
+  pad.appendChild(btn);
+  pad.appendChild(input);
+  padRow.appendChild(pad);
+  buttons.push(btn);
+  inputs.push(input);
+}
+
+// ── Mic pad (after the 6 note pads) ──
+const micPad = document.createElement('div');
+micPad.className = 'pad';
+
+const micBtn = document.createElement('button');
+micBtn.className = 'key-btn';
+micBtn.id = 'micBtn';
+micBtn.textContent = '🎤';
+
+const freqDisplay = document.createElement('div');
+freqDisplay.className = 'freq-display';
+freqDisplay.textContent = '0 Hz';
+
+micPad.appendChild(micBtn);
+micPad.appendChild(freqDisplay);
+padRow.appendChild(micPad);
+
+// ── Mic / pitch detection / recording ──
+let micActive   = false;
+let micStream   = null;
+let micSource   = null;
+let micAnalyser = null;
+let micBuf      = null;
+let micRaf      = null;
+
+// Recording state machine
+let recStartTime     = 0;    // performance.now() at mic-on
+let recNotes         = [];   // completed notes: {startSec, durationSec, medianHz}
+let recState         = 'silence'; // 'silence' | 'note'
+let noteStartSec     = 0;
+let notePitches      = [];
+let silenceFrames    = 0;
+
+const SILENCE_GATE      = 0.015; // RMS below this = silence
+const SILENCE_HOLD_MS   = 60;    // ms of silence before note ends
+const MIN_NOTE_MS       = 80;    // discard notes shorter than this
+
+micBtn.addEventListener('click', toggleMic);
+
+async function toggleMic() {
+  if (micActive) {
+    finalizeOpenNote();       // close any note still ringing
+    const totalDur = (performance.now() - recStartTime) / 1000;
+    teardownMic();
+    if (recNotes.length > 0) insertRecordedBars(totalDur);
+  } else {
+    await startMic();
+  }
+}
+
+async function startMic() {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    micSource   = audioCtx.createMediaStreamSource(micStream);
+    micAnalyser = audioCtx.createAnalyser();
+    micAnalyser.fftSize = 2048;
+    micBuf = new Float32Array(micAnalyser.fftSize);
+    micSource.connect(micAnalyser);
+    // Reset recording state
+    recStartTime  = performance.now();
+    recNotes      = [];
+    recState      = 'silence';
+    notePitches   = [];
+    silenceFrames = 0;
+    micActive = true;
+    micBtn.classList.add('active');
+    pitchLoop();
+  } catch(err) {
+    console.error('Mic error:', err);
+  }
+}
+
+function teardownMic() {
+  if (micRaf)    { cancelAnimationFrame(micRaf); micRaf = null; }
+  if (micSource) { micSource.disconnect(); micSource = null; }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  micAnalyser = null;
+  micActive   = false;
+  micBtn.classList.remove('active');
+  freqDisplay.textContent = '0 Hz';
+}
+
+function pitchLoop() {
+  if (!micActive) return;
+  micAnalyser.getFloatTimeDomainData(micBuf);
+
+  const f   = detectPitch(micBuf, audioCtx.sampleRate);
+  const now = (performance.now() - recStartTime) / 1000;
+
+  freqDisplay.textContent = f > 0 ? f + ' Hz' : '– Hz';
+
+  // ── State machine ──
+  if (f > 0) {
+    silenceFrames = 0;
+    if (recState === 'silence') {
+      recState     = 'note';
+      noteStartSec = now;
+      notePitches  = [f];
+    } else {
+      notePitches.push(f);
+    }
+  } else {
+    if (recState === 'note') {
+      silenceFrames++;
+      const silenceMs = silenceFrames * (1000 / 60); // ~60fps
+      if (silenceMs >= SILENCE_HOLD_MS) {
+        finalizeOpenNote();
+      }
+    }
+  }
+
+  micRaf = requestAnimationFrame(pitchLoop);
+}
+
+function finalizeOpenNote() {
+  if (recState !== 'note' || notePitches.length === 0) return;
+  const endSec = (performance.now() - recStartTime) / 1000;
+  const dur    = endSec - noteStartSec - (silenceFrames / 60); // subtract held silence
+  if (dur * 1000 >= MIN_NOTE_MS) {
+    recNotes.push({ startSec: noteStartSec, durationSec: dur, medianHz: median(notePitches) });
+  }
+  recState      = 'silence';
+  notePitches   = [];
+  silenceFrames = 0;
+}
+
+function median(arr) {
+  const s = [...arr].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+function closestButtonRow(hz) {
+  let best = 0, bestCents = Infinity;
+  for (let i = 0; i < NUM_PADS; i++) {
+    const cents = Math.abs(1200 * Math.log2(hz / getFreq(i)));
+    if (cents < bestCents) { bestCents = cents; best = i; }
+  }
+  return best;
+}
+
+function insertRecordedBars(totalDur) {
+  // Shift all existing bars at or after the playhead rightward
+  for (let r = 0; r < 6; r++) {
+    for (const bar of bars[r]) {
+      if (bar.start >= playhead) bar.start += totalDur;
+    }
+  }
+  // Insert detected notes
+  for (const note of recNotes) {
+    const row = closestButtonRow(note.medianHz);
+    bars[row].push({ start: playhead + note.startSec, duration: note.durationSec });
+  }
+  recNotes = [];
+  saveBars();
+  draw();
+}
+
+function detectPitch(buf, sampleRate) {
+  // Silence gate
+  let rms = 0;
+  for (let i = 0; i < buf.length; i++) rms += buf[i] * buf[i];
+  if (Math.sqrt(rms / buf.length) < SILENCE_GATE) return -1;
+
+  const SIZE = buf.length;
+
+  // Autocorrelation
+  const c = new Float32Array(SIZE);
+  for (let lag = 0; lag < SIZE / 2; lag++) {
+    let s = 0;
+    for (let i = 0; i < SIZE - lag; i++) s += buf[i] * buf[i + lag];
+    c[lag] = s;
+  }
+
+  // Skip the initial peak at lag=0 by finding first dip
+  let dip = 0;
+  while (dip < SIZE / 2 - 1 && c[dip] >= c[dip + 1]) dip++;
+
+  // Search within 60–4000 Hz range
+  const minLag = Math.max(dip, Math.floor(sampleRate / 4000));
+  const maxLag = Math.min(Math.ceil(sampleRate / 60), SIZE / 2 - 2);
+
+  let bestCorr = -1, bestLag = -1;
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    if (c[lag] > bestCorr) { bestCorr = c[lag]; bestLag = lag; }
+  }
+
+  if (bestLag < 1 || bestCorr < c[0] * 0.25) return -1;
+
+  // Parabolic interpolation for sub-sample accuracy
+  const prev = c[bestLag - 1], curr = c[bestLag], next = c[bestLag + 1];
+  const denom = prev - 2 * curr + next;
+  const refined = denom !== 0 ? bestLag - (prev - next) / (2 * denom) : bestLag;
+
+  return Math.round(sampleRate / refined);
+}
+
+function saveFreqs() {
+  localStorage.setItem('saxPadFreqs', JSON.stringify(
+    inputs.map(inp => Math.round(parseFloat(inp.value)) || DEFAULT_FREQS[0])
+  ));
+}
+
+function getFreq(i) {
+  return Math.round(parseFloat(inputs[i].value)) || DEFAULT_FREQS[i];
+}
+
+function startNote(i) {
+  if (activeVoices[i]) return;
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+
+  const freq = getFreq(i);
+  const now = audioCtx.currentTime;
+
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(0.55, now + 0.04);
+  gain.gain.linearRampToValueAtTime(0.42, now + 0.15);
+
+  const filt = audioCtx.createBiquadFilter();
+  filt.type = 'lowpass';
+  filt.frequency.value = freq * 6;
+  filt.Q.value = 1.2;
+
+  const boost = audioCtx.createBiquadFilter();
+  boost.type = 'peaking';
+  boost.frequency.value = freq * 3;
+  boost.gain.value = 6;
+  boost.Q.value = 2;
+
+  const osc1 = audioCtx.createOscillator();
+  osc1.type = 'sawtooth';
+  osc1.frequency.value = freq;
+
+  const osc2 = audioCtx.createOscillator();
+  osc2.type = 'sawtooth';
+  osc2.frequency.value = freq * 1.003;
+
+  const lfo = audioCtx.createOscillator();
+  lfo.type = 'sine';
+  lfo.frequency.value = 5.5;
+  const lfoGain = audioCtx.createGain();
+  lfoGain.gain.setValueAtTime(0, now);
+  lfoGain.gain.linearRampToValueAtTime(freq * 0.012, now + 0.18);
+  lfo.connect(lfoGain);
+  lfoGain.connect(osc1.frequency);
+  lfoGain.connect(osc2.frequency);
+
+  osc1.connect(filt); osc2.connect(filt);
+  filt.connect(boost); boost.connect(gain);
+  gain.connect(audioCtx.destination);
+
+  osc1.start(now); osc2.start(now); lfo.start(now);
+  activeVoices[i] = { gain, osc1, osc2, lfo };
+  buttons[i].classList.add('active');
+}
+
+function stopNote(i) {
+  const v = activeVoices[i];
+  if (!v) return;
+  const now = audioCtx.currentTime;
+  v.gain.gain.cancelScheduledValues(now);
+  v.gain.gain.setValueAtTime(v.gain.gain.value, now);
+  v.gain.gain.linearRampToValueAtTime(0, now + 0.18);
+  v.osc1.stop(now + 0.18);
+  v.osc2.stop(now + 0.18);
+  v.lfo.stop(now + 0.18);
+  delete activeVoices[i];
+  buttons[i].classList.remove('active');
+}
+
+const keyMap = { '1':0, '2':1, '3':2, '4':3, '5':4, '6':5 };
+const heldKeys = new Set();
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+
+  // Delete selected bars
+  if ((e.key === 'Delete' || e.key === 'Backspace') && selected.size > 0) {
+    for (let r = 0; r < 6; r++) bars[r] = bars[r].filter(b => !selected.has(b));
+    selected.clear();
+    saveBars();
+    draw();
+    return;
+  }
+
+  const i = keyMap[e.key];
+  if (i === undefined || heldKeys.has(e.key)) return;
+  heldKeys.add(e.key);
+  startNote(i);
+});
+document.addEventListener('keyup', e => {
+  const i = keyMap[e.key];
+  if (i === undefined) return;
+  heldKeys.delete(e.key);
+  stopNote(i);
+});
+
+buttons.forEach((btn, i) => {
+  btn.addEventListener('mousedown', e => { e.preventDefault(); startNote(i); });
+  btn.addEventListener('mouseup',   () => stopNote(i));
+  btn.addEventListener('mouseleave',() => stopNote(i));
+  btn.addEventListener('touchstart',e => { e.preventDefault(); startNote(i); }, { passive: false });
+  btn.addEventListener('touchend',  () => stopNote(i));
+});
+
+
+// ════════════════════════════════════════════
+// TIMELINE
+// ════════════════════════════════════════════
+const canvas  = document.getElementById('timeline');
+const ctx     = canvas.getContext('2d');
+
+const LABEL_W        = 36;
+const RULER_H        = 24;
+const ROW_H          = 52;
+const TOTAL_SEC      = 8;
+const DEFAULT_DUR    = 0.5;
+
+const ROW_COLORS = [
+  '#c0392b', '#d4690d', '#b8a000', '#1e8449', '#1a6fa8', '#7d3c98'
+];
+
+// bars[row] = [{start, duration}, ...]
+let bars = Array.from({ length: 6 }, () => []);
+try {
+  const s = localStorage.getItem('musicAppBars');
+  if (s) bars = JSON.parse(s);
+} catch(e) {}
+
+function saveBars() {
+  localStorage.setItem('musicAppBars', JSON.stringify(bars));
+}
+
+// ── Coordinate helpers ──
+function tlW()        { return canvas.width - LABEL_W; }
+function secToX(t)    { return LABEL_W + (t / TOTAL_SEC) * tlW(); }
+function xToSec(x)    { return Math.max(0, Math.min(TOTAL_SEC, ((x - LABEL_W) / tlW()) * TOTAL_SEC)); }
+function yToRow(y)    { return Math.floor((y - RULER_H) / ROW_H); }
+
+const EDGE_PX = 7;    // px within edge to trigger resize
+const SNAP_SEC = 0.12; // seconds snap threshold
+const MIN_DUR  = 0.05; // minimum bar duration in seconds
+
+function hitBar(x, y) {
+  if (y < RULER_H) return null;
+  const row = yToRow(y);
+  if (row < 0 || row >= 6) return null;
+  for (let i = 0; i < bars[row].length; i++) {
+    const b  = bars[row][i];
+    const bx = secToX(b.start);
+    const bw = Math.max(10, (b.duration / TOTAL_SEC) * tlW());
+    if (x < bx - EDGE_PX || x > bx + bw + EDGE_PX) continue;
+    let edge = 'body';
+    if (x <= bx + EDGE_PX)        edge = 'left';
+    else if (x >= bx + bw - EDGE_PX) edge = 'right';
+    return { row, i, edge };
+  }
+  return null;
+}
+
+// Collect all bar boundary times, excluding a Set of bar objects
+function snapPts(excludeSet) {
+  const pts = [0, TOTAL_SEC];
+  for (let r = 0; r < 6; r++) {
+    for (const bar of bars[r]) {
+      if (excludeSet && excludeSet.has(bar)) continue;
+      pts.push(bar.start);
+      pts.push(bar.start + bar.duration);
+    }
+  }
+  return pts;
+}
+
+function snapVal(t, pts) {
+  let best = null, minD = SNAP_SEC;
+  for (const p of pts) {
+    const d = Math.abs(t - p);
+    if (d < minD) { minD = d; best = p; }
+  }
+  return best !== null ? best : t;
+}
+
+// Snap a move: tries snapping the bar's start AND end, picks whichever is closer
+function snapMove(candStart, dur, pts) {
+  let best = null, minD = SNAP_SEC;
+  for (const p of pts) {
+    const ds = Math.abs(candStart - p);
+    if (ds < minD) { minD = ds; best = p; }
+    const de = Math.abs((candStart + dur) - p);
+    if (de < minD) { minD = de; best = p - dur; }
+  }
+  return best !== null ? best : candStart;
+}
+
+// ── Draw ──
+function rRect(x, y, w, h, r) {
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+let hoveredRow = -1;
+let hoveredBar = null;      // bar object under the mouse cursor
+let selected   = new Set(); // Set of bar objects
+let selBox     = null;      // rubber-band: { x0, y0, x1, y1 } in canvas px
+
+function draw() {
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // Canvas background
+  ctx.fillStyle = '#0f0f20';
+  ctx.fillRect(0, 0, W, H);
+
+  // ── Ruler ──
+  ctx.fillStyle = '#0a0a1a';
+  ctx.fillRect(LABEL_W, 0, W - LABEL_W, RULER_H);
+  ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(LABEL_W, RULER_H - 0.5);
+  ctx.lineTo(W, RULER_H - 0.5);
+  ctx.stroke();
+
+  for (let s = 0; s <= TOTAL_SEC; s++) {
+    const gx = secToX(s);
+    // Tick mark
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(gx, RULER_H - 7);
+    ctx.lineTo(gx, RULER_H);
+    ctx.stroke();
+    // Label
+    if (s > 0 && s < TOTAL_SEC) {
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.font = '9px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(s + 's', gx, RULER_H / 2);
+    }
+  }
+
+  // ── Rows ──
+  for (let r = 0; r < 6; r++) {
+    const y   = RULER_H + r * ROW_H;
+    const col = ROW_COLORS[r];
+    const hot = r === hoveredRow;
+
+    // Row background
+    ctx.globalAlpha = hot ? 0.32 : 0.18;
+    ctx.fillStyle = col;
+    ctx.fillRect(LABEL_W, y, W - LABEL_W, ROW_H - 1);
+    ctx.globalAlpha = 1;
+
+    // Row border
+    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, y + ROW_H - 0.5);
+    ctx.lineTo(W, y + ROW_H - 0.5);
+    ctx.stroke();
+
+    // Label
+    ctx.fillStyle = hot ? '#ffffff' : '#999';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(r + 1, LABEL_W / 2, y + ROW_H / 2);
+
+    // Bars
+    for (const bar of bars[r]) {
+      const bx = secToX(bar.start);
+      const bw = Math.max(5, (bar.duration / TOTAL_SEC) * tlW());
+      const by = y + 5, bh = ROW_H - 10;
+
+      ctx.globalAlpha = 0.88;
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      rRect(bx, by, bw, bh, 4);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      const isHighlighted = selected.has(bar) || bar === hoveredBar;
+      ctx.strokeStyle = isHighlighted ? '#ffffff' : 'rgba(255,255,255,0.35)';
+      ctx.lineWidth   = isHighlighted ? 2 : 1;
+      ctx.beginPath();
+      rRect(bx, by, bw, bh, 4);
+      ctx.stroke();
+
+      if (isHighlighted) {
+        ctx.fillStyle = 'rgba(255,255,255,0.12)';
+        ctx.globalAlpha = 1;
+        ctx.beginPath();
+        rRect(bx, by, bw, bh, 4);
+        ctx.fill();
+      }
+    }
+  }
+
+  // ── Grid lines (rows only, no labels) ──
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+  ctx.lineWidth = 1;
+  for (let s = 0; s <= TOTAL_SEC; s++) {
+    const gx = secToX(s);
+    ctx.beginPath();
+    ctx.moveTo(gx, RULER_H);
+    ctx.lineTo(gx, H);
+    ctx.stroke();
+  }
+
+  // ── Playhead ──
+  const px = secToX(playhead);
+  ctx.strokeStyle = '#c8a96e';
+  ctx.lineWidth = 2;
+  ctx.globalAlpha = 0.95;
+  ctx.beginPath();
+  ctx.moveTo(px, 0);
+  ctx.lineTo(px, H);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  // Playhead triangle (sits in the ruler, points down)
+  ctx.fillStyle = '#c8a96e';
+  ctx.beginPath();
+  ctx.moveTo(px - 7, 0);
+  ctx.lineTo(px + 7, 0);
+  ctx.lineTo(px, RULER_H - 2);
+  ctx.closePath();
+  ctx.fill();
+
+  // ── Rubber-band ──
+  if (selBox) {
+    const rx = Math.min(selBox.x0, selBox.x1), rw = Math.abs(selBox.x1 - selBox.x0);
+    const ry = Math.min(selBox.y0, selBox.y1), rh = Math.abs(selBox.y1 - selBox.y0);
+    ctx.fillStyle = 'rgba(200,169,110,0.07)';
+    ctx.fillRect(rx, ry, rw, rh);
+    ctx.strokeStyle = 'rgba(200,169,110,0.75)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    ctx.strokeRect(rx, ry, rw, rh);
+    ctx.setLineDash([]);
+  }
+}
+
+function resizeCanvas() {
+  canvas.width  = document.getElementById('timelineWrap').clientWidth;
+  canvas.height = RULER_H + 6 * ROW_H;
+  draw();
+}
+window.addEventListener('resize', resizeCanvas);
+
+
+// ── Mouse interactions ──
+// dragState.mode: 'move' | 'resize-left' | 'resize-right'
+let dragState        = null;
+let isDragging       = false;
+let playheadDragging = false;
+
+function cursorForHit(hit) {
+  if (!hit) return 'crosshair';
+  if (hit.edge === 'left' || hit.edge === 'right') return 'ew-resize';
+  return 'grab';
+}
+
+document.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  const overCanvas = x >= 0 && x <= canvas.width && y >= 0 && y <= canvas.height;
+
+  // ── Playhead drag ──
+  if (playheadDragging) {
+    playhead = xToSec(x);
+    draw();
+    return;
+  }
+
+  // ── Rubber-band ──
+  if (selBox) {
+    selBox.x1 = x; selBox.y1 = y;
+    selected.clear();
+    const rx0 = Math.min(selBox.x0, selBox.x1), rx1 = Math.max(selBox.x0, selBox.x1);
+    const ry0 = Math.min(selBox.y0, selBox.y1), ry1 = Math.max(selBox.y0, selBox.y1);
+    for (let r = 0; r < 6; r++) {
+      const rowY0 = RULER_H + r * ROW_H, rowY1 = rowY0 + ROW_H;
+      if (ry1 < rowY0 || ry0 > rowY1) continue;
+      for (const bar of bars[r]) {
+        const bx0 = secToX(bar.start);
+        const bx1 = secToX(bar.start + bar.duration);
+        if (rx1 >= bx0 && rx0 <= bx1) selected.add(bar);
+      }
+    }
+    draw();
+    return;
+  }
+
+  // ── Bar drag / resize ──
+  if (dragState && !isDragging && Math.abs(x - dragState.startX) > 2) {
+    isDragging = true;
+  }
+
+  if (isDragging && dragState) {
+    const bar = bars[dragState.row][dragState.i];
+    const t   = xToSec(x);
+
+    if (dragState.mode === 'move') {
+      const pts     = snapPts(dragState.groupStarts ? new Set(dragState.groupStarts.keys()) : new Set([bar]));
+      const raw     = t - dragState.offsetSec;
+      const snapped = snapMove(raw, bar.duration, pts);
+      const delta   = snapped - dragState.groupStarts.get(bar);
+      for (const [b, orig] of dragState.groupStarts) {
+        b.start = Math.max(0, Math.min(TOTAL_SEC - b.duration, orig + delta));
+      }
+      canvas.style.cursor = 'grabbing';
+
+    } else if (dragState.mode === 'resize-right') {
+      const pts    = snapPts(new Set([bar]));
+      const newEnd = Math.max(bar.start + MIN_DUR, Math.min(TOTAL_SEC, snapVal(t, pts)));
+      bar.duration = newEnd - bar.start;
+      canvas.style.cursor = 'ew-resize';
+
+    } else if (dragState.mode === 'resize-left') {
+      const pts      = snapPts(new Set([bar]));
+      const oldEnd   = bar.start + bar.duration;
+      const newStart = Math.min(oldEnd - MIN_DUR, Math.max(0, snapVal(t, pts)));
+      bar.duration   = oldEnd - newStart;
+      bar.start      = newStart;
+      canvas.style.cursor = 'ew-resize';
+    }
+
+    draw();
+    return;
+  }
+
+  // ── Hover (only meaningful when over the canvas) ──
+  if (overCanvas) {
+    const row = yToRow(y);
+    hoveredRow = (row >= 0 && row < 6) ? row : -1;
+    const hit2 = hitBar(x, y);
+    hoveredBar = hit2 ? bars[hit2.row][hit2.i] : null;
+    canvas.style.cursor = cursorForHit(hit2);
+  } else {
+    hoveredRow = -1;
+    hoveredBar = null;
+    canvas.style.cursor = 'default';
+  }
+  draw();
+});
+
+canvas.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  const r = canvas.getBoundingClientRect();
+  const x = e.clientX - r.left, y = e.clientY - r.top;
+
+  // ── Ruler click / playhead drag ──
+  if (y < RULER_H) {
+    playhead = xToSec(x);
+    playheadDragging = true;
+    draw();
+    return;
+  }
+
+  // ── Playhead line drag (from the rows area) ──
+  if (Math.abs(x - secToX(playhead)) <= 5 && !hitBar(x, y)) {
+    playheadDragging = true;
+    return;
+  }
+
+  const hit = hitBar(x, y);
+
+  if (hit && e.metaKey) {
+    // Cmd+click: toggle bar in selection
+    const bar = bars[hit.row][hit.i];
+    if (selected.has(bar)) selected.delete(bar); else selected.add(bar);
+    draw();
+    return;
+  }
+
+  if (hit) {
+    const bar  = bars[hit.row][hit.i];
+    const mode = hit.edge === 'left'  ? 'resize-left'  :
+                 hit.edge === 'right' ? 'resize-right' : 'move';
+
+    // For move: snapshot start positions of all bars that will move
+    let groupStarts;
+    if (mode === 'move') {
+      const moveSet = selected.has(bar) ? selected : new Set([bar]);
+      groupStarts   = new Map([...moveSet].map(b => [b, b.start]));
+    }
+
+    dragState  = {
+      row: hit.row, i: hit.i, mode,
+      offsetSec:   xToSec(x) - bar.start,
+      origEnd:     bar.start + bar.duration,
+      groupStarts,
+      clickBar:    bar,
+      startX: x,
+    };
+    isDragging = false;
+    return;
+  }
+
+  // Click on empty → clear selection, start rubber-band
+  selected.clear();
+  selBox = { x0: x, y0: y, x1: x, y1: y };
+  draw();
+});
+
+document.addEventListener('mouseup', () => {
+  playheadDragging = false;
+  if (dragState && !isDragging && dragState.clickBar) {
+    // Plain click on a bar → select only that bar
+    selected.clear();
+    selected.add(dragState.clickBar);
+    draw();
+  }
+  if (isDragging) saveBars();
+  dragState  = null;
+  isDragging = false;
+  selBox     = null;
+  canvas.style.cursor = 'crosshair';
+});
+
+canvas.addEventListener('dblclick', e => {
+  e.preventDefault();
+  const r = canvas.getBoundingClientRect();
+  const x = e.clientX - r.left, y = e.clientY - r.top;
+  const hit = hitBar(x, y);
+  if (hit) {
+    const bar = bars[hit.row][hit.i];
+    selected.delete(bar);
+    bars[hit.row].splice(hit.i, 1);
+  } else {
+    const row = yToRow(y);
+    if (row >= 0 && row < 6) {
+      const start = Math.max(0, Math.min(TOTAL_SEC - DEFAULT_DUR, xToSec(x)));
+      bars[row].push({ start, duration: DEFAULT_DUR });
+    }
+  }
+  saveBars();
+  draw();
+});
+
+
+// ════════════════════════════════════════════
+// TRANSPORT & PLAYBACK
+// ════════════════════════════════════════════
+let isPlaying    = false;
+let playhead     = 0;
+let playStartAt  = 0;   // audioCtx time when play was pressed
+let playOffset   = 0;   // playhead value when play was pressed
+let scheduled    = [];
+let rafId        = null;
+
+function scheduleSeqNote(row, delayFromNow, dur) {
+  if (dur <= 0) return;
+  const freq    = getFreq(row);
+  const now     = audioCtx.currentTime;
+  const startAt = now + delayFromNow;
+  const stopAt  = startAt + dur;
+
+  const gain = audioCtx.createGain();
+  const filt = audioCtx.createBiquadFilter();
+  filt.type = 'lowpass';
+  filt.frequency.value = freq * 6;
+  filt.Q.value = 1.2;
+
+  const o1 = audioCtx.createOscillator();
+  o1.type = 'sawtooth'; o1.frequency.value = freq;
+  const o2 = audioCtx.createOscillator();
+  o2.type = 'sawtooth'; o2.frequency.value = freq * 1.003;
+
+  const atkEnd  = startAt + 0.04;
+  const decEnd  = startAt + 0.15;
+  const relStart = Math.max(decEnd, stopAt - 0.08);
+
+  gain.gain.setValueAtTime(0, startAt);
+  gain.gain.linearRampToValueAtTime(0.5, atkEnd);
+  gain.gain.linearRampToValueAtTime(0.38, decEnd);
+  if (relStart > decEnd) gain.gain.setValueAtTime(0.38, relStart);
+  gain.gain.linearRampToValueAtTime(0, stopAt);
+
+  o1.connect(filt); o2.connect(filt);
+  filt.connect(gain); gain.connect(audioCtx.destination);
+
+  o1.start(startAt); o2.start(startAt);
+  o1.stop(stopAt + 0.01); o2.stop(stopAt + 0.01);
+  scheduled.push({ o1, o2 });
+}
+
+function cancelAll() {
+  scheduled.forEach(({ o1, o2 }) => {
+    try { o1.stop(0); } catch(e) {}
+    try { o2.stop(0); } catch(e) {}
+  });
+  scheduled = [];
+}
+
+function play() {
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  isPlaying   = true;
+  playOffset  = playhead;
+  playStartAt = audioCtx.currentTime;
+
+  for (let row = 0; row < 6; row++) {
+    for (const bar of bars[row]) {
+      const barEnd = bar.start + bar.duration;
+      if (barEnd <= playhead) continue;
+      const delay   = Math.max(0, bar.start - playhead);
+      const playDur = barEnd - Math.max(playhead, bar.start);
+      scheduleSeqNote(row, delay, playDur);
+    }
+  }
+
+  function tick() {
+    playhead = playOffset + (audioCtx.currentTime - playStartAt);
+    if (playhead >= TOTAL_SEC) {
+      playhead  = 0;
+      isPlaying = false;
+      scheduled = [];
+      draw();
+      updateUI();
+      return;
+    }
+    draw();
+    rafId = requestAnimationFrame(tick);
+  }
+  rafId = requestAnimationFrame(tick);
+  updateUI();
+}
+
+function pause() {
+  if (!isPlaying) return;
+  isPlaying = false;
+  playhead  = playOffset + (audioCtx.currentTime - playStartAt);
+  cancelAnimationFrame(rafId);
+  cancelAll();
+  draw();
+  updateUI();
+}
+
+function stop() {
+  isPlaying = false;
+  cancelAnimationFrame(rafId);
+  cancelAll();
+  playhead = 0;
+  draw();
+  updateUI();
+}
+
+function updateUI() {
+  const btn = document.getElementById('btnPlay');
+  if (isPlaying) {
+    btn.textContent = '⏸';
+    btn.style.background = '#c8a96e';
+    btn.style.color = '#1a1a2e';
+  } else {
+    btn.textContent = '▶';
+    btn.style.background = '#27ae60';
+    btn.style.color = '#fff';
+  }
+}
+
+document.getElementById('btnPlay').addEventListener('click', () => isPlaying ? pause() : play());
+document.getElementById('btnStop').addEventListener('click', stop);
+document.getElementById('btnClear').addEventListener('click', () => {
+  bars = Array.from({ length: 6 }, () => []);
+  selected.clear();
+  saveBars();
+  draw();
+});
+
+
+// ── Init ──
+resizeCanvas();
+</script>
+</body>
+</html>
